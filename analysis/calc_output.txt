@@ -1,0 +1,73 @@
+== 1. Raw input ==
+  pixels / frame (MP)                                         20.97 MP
+  NV12 frame size                                             31.46 MB
+  pixel rate, both streams                                 1,258.29 MP/s
+  raw capture write bandwidth, both streams                    1.89 GB/s
+  ISP output capacity (2 x 1080p60)                          248.83 MP/s
+  -> demand / ISP capacity                                     5.06 x
+  Encoder capacity (4K30)                                    248.83 MP/s
+  -> full-res encode demand / encoder capacity                 5.06 x
+
+== 2. Naive pipeline DDR traffic (CPU/OpenCV, full resolution) ==
+  1 capture write                                             31.46 MB/frame
+  2 remap: read src (x overfetch)                             37.75 MB/frame
+  2 remap: read float map (8 B/px)                           167.77 MB/frame
+  2 remap: write undistorted NV12                             31.46 MB/frame
+  3 cvtColor: read NV12                                       31.46 MB/frame
+  3 cvtColor: write RGB888                                    62.91 MB/frame
+  4 resize: read RGB888                                       62.91 MB/frame
+  4 resize: write 640x640x3                                    1.23 MB/frame
+  8 overlay (touch boxes, ~1%)                                 0.31 MB/frame
+  9 encoder read + refs (x3)                                  94.37 MB/frame
+  TOTAL per frame (excl. NN)                                 521.64 MB
+  TOTAL both streams                                          31.30 GB/s
+  -> % of sustained DDR (18 GB/s)                            173.88 %
+
+== 3. Naive CPU compute for stages 2-3 ==
+  A78 cores needed for remap                                   7.55 cores
+  A78 cores needed for NV12->RGB                               1.57 cores
+  available big cores                                          4.00 cores
+
+== 4. Detector compute ==
+  required (both streams)                                    510.00 GOPS
+  NPU INT8 peak utilisation needed                             6.38 %
+  NPU compute time @35% util                                   3.04 ms
+  NPU memory time (weights+acts @ 8 GB/s)                      6.03 ms
+  NPU DDR traffic per inference                               48.23 MB
+  NPU latency estimate (max + 1.5 ms setup)                    7.53 ms
+  NPU busy (60 inf/s)                                         45.17 %
+  GPU FP16 per inference @30% util                            28.33 ms
+  GPU busy if it ran detection (60 inf/s)                    170.00 %
+  4xA78 INT8 SDOT peak                                       512.00 GOPS
+  -> CPU utilisation needed                                   99.61 %
+  SiLU fallback: partition overhead                           34.20 ms/inf
+  SiLU fallback: CPU elementwise                              22.00 ms/inf
+  SiLU fallback total per inference                           56.20 ms
+
+== 5. Optimised pipeline DDR traffic ==
+  1 capture write (full res)                                  31.46 MB/frame
+  A GPU undistort+2x2avg+downscale: read src                  37.75 MB/frame
+  A sparse map (16px grid, FP32x2)                             0.04 MB/frame
+  A write 1280x1024 NV12                                       1.97 MB/frame
+  B GPU letterbox+RGB: read 1280x1024                          1.97 MB/frame
+  B write 640x640x3 uint8 tensor                               1.23 MB/frame
+  5 NPU weights + activations                                 47.00 MB/frame
+  6 head outputs (INT8, 8400 x 84)                             0.71 MB/frame
+  8 overlay RMW (~5% of frame)                                 0.20 MB/frame
+  9 encoder read + refs (x3)                                   5.90 MB/frame
+  TOTAL per frame                                            128.21 MB
+  TOTAL both streams                                           7.69 GB/s
+  -> % of sustained DDR                                       42.74 %
+  variant: sensor 2x2 binning -> both streams                  4.58 GB/s
+  Pass A time (bandwidth bound @ 8 GB/s)                       4.72 ms
+  encode px/s (2 x 1280x1024@30) vs cap                       31.60 % of enc
+
+== 6. NMS ==
+  worst-case IoU pairs, 8400 boxes                            35.28 M
+    @ ~1 ns/IoU NEON-ish (ms)                                 35.28 ms
+  with top-K=1000 cap                                          0.50 M pairs
+    (ms)                                                       0.50 ms
+  class-score scan 8400 x 80 (INT8 compares)                   0.67 M ops
+
+== 7. Memory footprint (CMA) ==
+  capture 4/stream + display 6/stream + tensors 3/stream + model       305.62 MB
